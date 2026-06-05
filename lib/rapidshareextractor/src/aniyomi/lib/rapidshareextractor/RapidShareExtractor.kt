@@ -5,10 +5,11 @@ import android.app.Application
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import aniyomi.lib.playlistutils.PlaylistUtils
-import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -37,64 +38,89 @@ class RapidShareExtractor(
 ) {
     companion object {
         private const val DEFAULT_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        private const val LOG_TAG = "YFlix"
     }
 
-    private val tag by lazy { javaClass.simpleName }
     private val playlistUtils by lazy { PlaylistUtils(client, headers) }
 
+    private fun playerHeaders(url: String): Headers {
+        val origin = url.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
+        return Headers.Builder().apply {
+            add("User-Agent", DEFAULT_USER_AGENT)
+            add("Accept", "*/*")
+            add("Accept-Language", "en-US,en;q=0.9")
+            add("Referer", url)
+            origin?.let { add("Origin", it) }
+            add("Sec-Fetch-Dest", "empty")
+            add("Sec-Fetch-Mode", "cors")
+            add("Sec-Fetch-Site", "cross-site")
+            add("Connection", "keep-alive")
+        }.build()
+    }
+
     private fun encDecHeaders(url: String): Headers {
-        val referer = headers["Referer"] ?: url
-        val origin = referer.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
-        return headers.newBuilder().apply {
-            set("User-Agent", headers["User-Agent"] ?: DEFAULT_USER_AGENT)
-            set("Accept", "application/json, text/plain, */*")
-            origin?.let { set("Origin", it) }
-            set("Referer", referer)
-            set("Sec-Fetch-Dest", "empty")
-            set("Sec-Fetch-Mode", "cors")
-            set("Sec-Fetch-Site", "cross-site")
+        val origin = url.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" }
+        return Headers.Builder().apply {
+            add("User-Agent", DEFAULT_USER_AGENT)
+            add("Accept", "application/json, text/plain, */*")
+            add("Referer", url)
+            origin?.let { add("Origin", it) }
         }.build()
     }
 
     private suspend fun unwrapIframeUrl(url: String): String {
         try {
             val parsedUrl = url.toHttpUrl()
-            val iframeHeaders = headers.newBuilder().apply {
-                set("User-Agent", headers["User-Agent"] ?: DEFAULT_USER_AGENT)
-                set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                set("Referer", url)
+            val iframeHeaders = Headers.Builder().apply {
+                add("User-Agent", DEFAULT_USER_AGENT)
+                add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                add("Referer", url)
             }.build()
 
             val html = client.newCall(GET(url, iframeHeaders))
                 .awaitSuccess()
                 .bodyString()
 
-            val iframeRegex = Regex("""<iframe[^>]+src=["']([^"']*(?:/e/|rapidshare)[^"']*)["']""", RegexOption.IGNORE_CASE)
+            val iframeRegex = Regex(
+                """<iframe[^>]+src=["']([^"']*(?:/e/|rapidshare|rabbitstream|megacloud|dokicloud|cloudemb|vidsrc|2embed|vdrk|primesrc)[^"']*)["']""",
+                RegexOption.IGNORE_CASE,
+            )
             var realUrl = iframeRegex.find(html)?.groupValues?.getOrNull(1)
+
+            if (realUrl.isNullOrBlank()) {
+                val genericIframeRegex = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                realUrl = genericIframeRegex.findAll(html)
+                    .map { it.groupValues[1] }
+                    .firstOrNull {
+                        it.contains("/e/") || it.contains("stream") ||
+                            it.contains("player") || it.contains("embed") || it.contains("vdrk")
+                    }
+            }
 
             if (!realUrl.isNullOrBlank()) {
                 val baseUrl = "${parsedUrl.scheme}://${parsedUrl.host}"
-                realUrl = UrlUtils.fixUrl(realUrl, baseUrl)
-
-                if (!realUrl.isNullOrBlank()) {
-                    Log.d(tag, "Unwrapped iframe via OkHttp: $realUrl")
-                    return realUrl
+                val fixed = UrlUtils.fixUrl(realUrl, baseUrl)
+                if (!fixed.isNullOrBlank()) {
+                    Log.d(LOG_TAG, "Extractor: Iframe encontrado vía HTML: $fixed")
+                    return fixed
                 }
             }
-        } catch (_: Exception) {
-            Log.d(tag, "OkHttp unwrap failed (Cloudflare block), falling back to WebView...")
+        } catch (e: Exception) {
+            Log.d(LOG_TAG, "Extractor: Fallo al leer HTML (${e.message})")
         }
 
         if (context != null) {
-            Log.d(tag, "Launching background WebView to bypass Cloudflare...")
-            return withTimeout(15_000) {
-                unwrapWithWebView(url)
+            Log.d(LOG_TAG, "Extractor: Intentando con WebView para saltar protección...")
+            return try {
+                withTimeout(25_000) { unwrapWithWebView(url) }
+            } catch (e: Exception) {
+                Log.e(LOG_TAG, "Extractor: WebView falló o agotó tiempo")
+                ""
             }
         }
 
-        Log.e(tag, "Failed to unwrap iframe. Blocked by Turnstile.")
-        throw Exception("Server is protected by Cloudflare Turnstile. Cannot extract video.")
+        return ""
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -104,38 +130,102 @@ class RapidShareExtractor(
                 val webView = WebView(context!!).apply {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
-                    settings.userAgentString = headers["User-Agent"]
-                        ?: DEFAULT_USER_AGENT
+                    settings.userAgentString = DEFAULT_USER_AGENT
 
                     webViewClient = object : WebViewClient() {
+                        private var isStarted = false
+
+                        override fun shouldInterceptRequest(
+                            view: WebView,
+                            request: WebResourceRequest,
+                        ): WebResourceResponse? {
+                            val reqUrl = request.url.toString()
+
+                            if (
+                                reqUrl.contains("rabbitstream.net/e/") ||
+                                reqUrl.contains("rapidshare.com/e/") ||
+                                reqUrl.contains("/ajax/v2/embed-code")
+                            ) {
+                                if (continuation.isActive) {
+                                    Log.d(LOG_TAG, "Extractor: ¡URL Capturada!: $reqUrl")
+                                    Handler(Looper.getMainLooper()).post { view.destroy() }
+                                    continuation.resume(reqUrl)
+                                }
+                            }
+
+                            if (reqUrl.contains(".m3u8") && !reqUrl.contains("hls/track")) {
+                                if (continuation.isActive) {
+                                    Log.d(LOG_TAG, "Extractor: ¡HLS Capturado!: $reqUrl")
+                                    // Usar el referer real del request para que el stream no dé 403
+                                    val reqReferer = request.requestHeaders["Referer"] ?: url
+                                    val videoWithHeaders = "$reqUrl#REFERER=$reqReferer"
+                                    Handler(Looper.getMainLooper()).post { view.destroy() }
+                                    continuation.resume(videoWithHeaders)
+                                }
+                            }
+                            return super.shouldInterceptRequest(view, request)
+                        }
+
                         override fun onPageFinished(view: WebView, loadedUrl: String) {
-                            if (loadedUrl.contains("/cdn-cgi/")) return
+                            if (loadedUrl.contains("/cdn-cgi/") || isStarted) return
+                            isStarted = true
 
-                            view.evaluateJavascript(
-                                """
-                                (function() {
-                                    try {
-                                        var iframe = document.querySelector('iframe[src]');
-                                        if (iframe && (iframe.src.includes('/e/') || iframe.src.includes('rapidshare'))) {
-                                            return iframe.src;
+                            Log.d(LOG_TAG, "Extractor: WebView cargó: " + view.title)
+
+                            val handler = Handler(Looper.getMainLooper())
+                            val checkIframe = object : Runnable {
+                                var attempts = 0
+                                override fun run() {
+                                    if (!continuation.isActive) return
+                                    attempts++
+
+                                    view.evaluateJavascript(
+                                        """
+                                        (function() {
+                                            var results = [];
+                                            var iframes = document.getElementsByTagName('iframe');
+                                            for (var i = 0; i < iframes.length; i++) {
+                                                var src = iframes[i].src || iframes[i].getAttribute('data-src') || iframes[i].getAttribute('data-lazy-src');
+                                                if (!src) continue;
+                                                results.push(src);
+                                                if (src.includes('/e/') || src.includes('stream') || src.includes('rapidshare') ||
+                                                    src.includes('rabbitstream') || src.includes('megacloud') || src.includes('vidsrc') ||
+                                                    src.includes('embed') || src.includes('vdrk') || src.includes('primesrc')) return src;
+                                            }
+                                            var html = document.documentElement.innerHTML;
+                                            var regex = /https?:\/\/[^\s"'<>]+(?:rabbitstream|rapidshare|megacloud|vidsrc|vdrk|primesrc)[^\s"'<>]+/gi;
+                                            var matches = html.match(regex);
+                                            if (matches && matches.length > 0) return matches[0];
+
+                                            return 'DEBUG:' + results.join('|');
+                                        })();
+                                        """.trimIndent(),
+                                    ) { result ->
+                                        val cleaned = result?.replace("\\\"", "\"")?.trim('"') ?: ""
+                                        if (cleaned.startsWith("DEBUG:")) {
+                                            if (attempts < 10 && continuation.isActive) {
+                                                handler.postDelayed(this, 2000)
+                                            } else if (continuation.isActive) {
+                                                view.destroy()
+                                                continuation.resume("")
+                                            }
+                                        } else if (cleaned.isNotEmpty() && cleaned != "null") {
+                                            Log.d(LOG_TAG, "Extractor: ¡Éxito en Intento $attempts!: $cleaned")
+                                            view.destroy()
+                                            continuation.resume(cleaned)
+                                        } else if (attempts < 10 && continuation.isActive) {
+                                            handler.postDelayed(this, 2000)
+                                        } else if (continuation.isActive) {
+                                            view.destroy()
+                                            continuation.resume("")
                                         }
-                                    } catch(e) {}
-                                    return '';
-                                })();
-                                """.trimIndent(),
-                            ) { result ->
-                                val extractedUrl = result?.replace("\\\"", "\"")?.trim('"')?.takeIf { it.isNotEmpty() && it != "null" }
-
-                                if (extractedUrl != null) {
-                                    view.destroy()
-                                    if (continuation.isActive) {
-                                        continuation.resume(extractedUrl)
                                     }
                                 }
                             }
+                            handler.postDelayed(checkIframe, 3000)
                         }
                     }
-                    loadUrl(url)
+                    loadUrl(url, mapOf("User-Agent" to DEFAULT_USER_AGENT))
                 }
 
                 continuation.invokeOnCancellation {
@@ -148,125 +238,130 @@ class RapidShareExtractor(
     }
 
     suspend fun videosFromUrl(url: String, prefix: String, preferredLang: String): List<Video> {
-        val parsedUrl = url.toHttpUrlOrNull() ?: return emptyList()
-        val userAgent = headers["User-Agent"] ?: DEFAULT_USER_AGENT
+        val realUrl = url.substringBefore("#REFERER=")
+        val savedReferer = url.substringAfter("#REFERER=", "")
 
-        // ==========================================
-        // 1. UNWRAP IFRAME (if needed)
-        // ==========================================
-        if (parsedUrl.pathSegments.firstOrNull() == "iframe") {
-            Log.d(tag, "Detected iframe wrapper. Attempting to unwrap...")
-            val unwrappedUrl = unwrapIframeUrl(url)
-            Log.d(tag, "Unwrapped real RapidShare URL: $unwrappedUrl")
-            return videosFromUrl(unwrappedUrl, prefix, preferredLang)
-        }
+        val isDirectRapid = realUrl.contains("/e/") ||
+            realUrl.contains("rapidshare") ||
+            realUrl.contains("rabbitstream")
 
-        // ==========================================
-        // 2. NORMAL RAPIDSHARE LOGIC
-        // ==========================================
-        val rapidUrl = url.toHttpUrl()
-        val token = rapidUrl.pathSegments.last()
-        val subtitleUrl = rapidUrl.queryParameter("sub.list")
-        // Dynamic base URL
-        val baseUrl = "${rapidUrl.scheme}://${rapidUrl.host}"
-        val mediaUrl = "$baseUrl/media/$token"
+        if (!isDirectRapid) {
+            if (realUrl.contains(".m3u8")) {
+                val refererToUse = savedReferer.ifBlank {
+                    realUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/" } ?: ""
+                }
+                // Headers completos para evitar 403 en el stream HLS
+                val videoHeaders = Headers.Builder().apply {
+                    add("User-Agent", DEFAULT_USER_AGENT)
+                    add("Referer", refererToUse)
+                    add("Origin", refererToUse.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}" } ?: refererToUse)
+                    add("Accept", "*/*")
+                    add("Accept-Language", "en-US,en;q=0.9")
+                    add("Sec-Fetch-Dest", "empty")
+                    add("Sec-Fetch-Mode", "cors")
+                    add("Sec-Fetch-Site", "cross-site")
+                    add("Connection", "keep-alive")
+                }.build()
+                return try {
+                    playlistUtils.extractFromHls(
+                        playlistUrl = realUrl,
+                        referer = refererToUse,
+                        videoNameGen = { quality -> "$prefix - $quality" },
+                    ).map { video -> Video(video.url, video.quality, video.videoUrl, videoHeaders) }
+                } catch (e: Exception) {
+                    Log.e(LOG_TAG, "Extractor: Fallo HLS: ${e.message}")
+                    emptyList()
+                }
+            }
 
-        val mediaHeaders = headers.newBuilder().apply {
-            set("User-Agent", userAgent)
-            set("Accept", "application/json, text/plain, */*")
-            set("X-Requested-With", "XMLHttpRequest")
-            set("Referer", url)
-        }.build()
+            // Para reproductores SPA (videasy, vidsync, etc.) usar WebView directamente
+            if (context != null) {
+                Log.d(LOG_TAG, "Extractor: Usando WebView para $prefix...")
+                return try {
+                    val captured = withTimeout(30_000) { unwrapWithWebView(realUrl) }
+                    if (captured.isNotBlank() && captured != realUrl) {
+                        videosFromUrl(captured, prefix, preferredLang)
+                    } else {
+                        emptyList()
+                    }
+                } catch (e: Exception) {
+                    Log.e(LOG_TAG, "Extractor: WebView falló para $prefix: ${e.message}")
+                    emptyList()
+                }
+            }
 
-        val encryptedResult = try {
-            client.newCall(GET(mediaUrl, mediaHeaders))
-                .awaitSuccess()
-                .parseAs<EncryptedRapidResponse>().result
-        } catch (_: Exception) {
+            // Sin WebView: intentar extraer iframe via HTTP
+            val unwrappedUrl = unwrapIframeUrl(realUrl)
+            if (unwrappedUrl.isNotBlank() && unwrappedUrl != realUrl) {
+                return videosFromUrl(unwrappedUrl, prefix, preferredLang)
+            }
             return emptyList()
         }
 
-        // Uses keiyoushi.utils.toRequestBody exactly like MegaUpExtractor
+        return processDirectRapid(realUrl, prefix)
+    }
+
+    private suspend fun processDirectRapid(url: String, prefix: String): List<Video> {
+        val rapidUrl = url.toHttpUrlOrNull() ?: return emptyList()
+        val userAgent = DEFAULT_USER_AGENT
+        val token = rapidUrl.pathSegments.lastOrNull() ?: return emptyList()
+        val baseUrl = "${rapidUrl.scheme}://${rapidUrl.host}"
+        val mediaUrl = "$baseUrl/media/$token"
+
+        val mediaHeaders = Headers.Builder().apply {
+            add("User-Agent", userAgent)
+            add("Accept", "application/json, text/plain, */*")
+            add("X-Requested-With", "XMLHttpRequest")
+            add("Referer", url)
+        }.build()
+
+        Log.d(LOG_TAG, "Extractor: Solicitando medios de $prefix")
+        val encryptedResult = try {
+            client.newCall(GET(mediaUrl, mediaHeaders)).awaitSuccess().parseAs<EncryptedRapidResponse>().result
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Extractor: Error en $prefix: ${e.message}")
+            return emptyList()
+        }
+
         val decryptionBody = buildJsonObject {
             put("text", encryptedResult)
             put("agent", userAgent)
         }.toJsonRequestBody()
 
         val rapidResult = try {
-            client.newCall(POST("https://enc-dec.app/api/dec-rapid", body = decryptionBody, headers = encDecHeaders(url)))
-                .awaitSuccess()
-                .parseAs<RapidDecryptResponse>().result
-        } catch (_: Exception) {
+            client.newCall(
+                POST("https://enc-dec.app/api/dec-rapid", body = decryptionBody, headers = encDecHeaders(url)),
+            ).awaitSuccess().parseAs<RapidDecryptResponse>().result
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Extractor: No se pudo desencriptar $prefix")
             return emptyList()
         }
 
-        val subtitleList = try {
-            if (subtitleUrl != null) {
-                getSubtitles(subtitleUrl, baseUrl)
-            } else {
-                rapidResult.tracks
-                    .filter { it.kind == "captions" && it.file.isNotBlank() && it.label != null }
-                    .map { Track(it.file, it.label!!) }
-            }
-        } catch (_: Exception) {
-            emptyList()
-        }
-
         val videoSources = rapidResult.sources
+        val playerHeaders = playerHeaders(url)
+
         return videoSources.flatMap { source ->
             val videoUrl = source.file
-            when {
-                videoUrl.contains(".m3u8") -> {
-                    playlistUtils.extractFromHls(
-                        playlistUrl = videoUrl,
-                        referer = "$baseUrl/",
-                        videoNameGen = { quality -> "$prefix - $quality" },
-                        subtitleList = subLangSelect(subtitleList, preferredLang),
-                    )
+            if (videoUrl.contains(".m3u8")) {
+                playlistUtils.extractFromHls(
+                    playlistUrl = videoUrl,
+                    referer = "$baseUrl/",
+                    videoNameGen = { quality -> "$prefix - $quality" },
+                ).map { video ->
+                    Video(video.url, video.quality, video.videoUrl, playerHeaders)
                 }
-
-                else -> emptyList()
+            } else {
+                emptyList()
             }
         }
     }
-
-    private suspend fun getSubtitles(url: String, baseUrl: String): List<Track> {
-        val subHeaders = headers.newBuilder()
-            .set("Accept", "*/*")
-            .set("Origin", baseUrl)
-            .set("Referer", "$baseUrl/")
-            .build()
-
-        return try {
-            client.newCall(GET(url, subHeaders))
-                .awaitSuccess()
-                .parseAs<List<RapidShareTrack>>()
-                .filter { it.kind == "captions" && it.file.isNotBlank() && it.label != null }
-                .map { Track(it.file, it.label!!) }
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    /**
-     * Puts the preferred language subtitle first in the list.
-     * The player will likely default to the first subtitle.
-     */
-    private fun subLangSelect(tracks: List<Track>, language: String): List<Track> = tracks.sortedByDescending { it.lang.contains(language, true) }
 }
 
-// ============================== RapidShare Responses ==============================
+@Serializable
+data class EncryptedRapidResponse(val result: String)
 
 @Serializable
-data class EncryptedRapidResponse(
-    val result: String,
-)
-
-@Serializable
-data class RapidDecryptResponse(
-    val status: Int,
-    val result: RapidShareResult,
-)
+data class RapidDecryptResponse(val status: Int, val result: RapidShareResult)
 
 @Serializable
 data class RapidShareResult(
@@ -275,13 +370,7 @@ data class RapidShareResult(
 )
 
 @Serializable
-data class RapidShareSource(
-    val file: String,
-)
+data class RapidShareSource(val file: String)
 
 @Serializable
-data class RapidShareTrack(
-    val file: String,
-    val label: String? = null,
-    val kind: String,
-)
+data class RapidShareTrack(val file: String, val label: String? = null, val kind: String)

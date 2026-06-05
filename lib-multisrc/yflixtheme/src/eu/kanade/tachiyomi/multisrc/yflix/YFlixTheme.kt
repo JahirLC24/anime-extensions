@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.multisrc.yflix
 
 import android.app.Application
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.preference.PreferenceScreen
 import aniyomi.lib.rapidshareextractor.RapidShareExtractor
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -28,7 +29,6 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 import uy.kohesive.injekt.injectLazy
 import java.math.BigDecimal
 import java.math.RoundingMode
@@ -59,16 +59,14 @@ open class YFlixTheme(
     override val baseUrl by preferences.delegate(PREF_DOMAIN_KEY, defaultDomain)
 
     protected open val encdecHeaders by lazy {
-        headers.newBuilder().apply {
-            set(
-                "User-Agent",
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36",
-            )
+        Headers.Builder().apply {
+            add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
         }.build()
     }
 
-    protected open fun headersReferrerBuilder(url: String = baseUrl): Headers.Builder = headers.newBuilder()
-        .set("Referer", "$url/")
+    protected open fun headersReferrerBuilder(url: String = baseUrl): Headers.Builder = Headers.Builder()
+        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36")
+        .add("Referer", "$url/")
 
     protected open var docHeaders by LazyMutable {
         headersReferrerBuilder().build()
@@ -80,21 +78,21 @@ open class YFlixTheme(
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/browser?sort=trending&page=$page")
+    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/tv-shows")
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseAnimesPage(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/browser?page=$page")
+    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/watch-movies-online")
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseAnimesPage(response)
 
     // =============================== Search ===============================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val url = "$baseUrl/browser".toHttpUrl().newBuilder()
-            .addQueryParameter("keyword", query)
+        val url = "$baseUrl/search".toHttpUrl().newBuilder()
+            .addQueryParameter("q", query)
             .addQueryParameter("page", page.toString())
             .also { builder ->
                 YFlixThemeFilters.getFilters(filters).forEach {
@@ -106,19 +104,19 @@ open class YFlixTheme(
 
     override fun searchAnimeParse(response: Response): AnimesPage = parseAnimesPage(response)
 
-    protected open val moviesSelector = "div.film-section div.item"
+    protected open val moviesSelector = "article.content-card"
 
     protected open fun parseAnimesPage(response: Response): AnimesPage {
         val document = response.asJsoup()
 
         val animes = document.select(moviesSelector).mapNotNull { item ->
-            val poster = item.selectFirst("a.poster") ?: return@mapNotNull null
-            val title = item.selectFirst("a.title")?.text() ?: return@mapNotNull null
+            val link = item.selectFirst("a") ?: return@mapNotNull null
+            val title = item.selectFirst("h3.card-title")?.text() ?: return@mapNotNull null
 
             SAnime.create().apply {
-                setUrlWithoutDomain(poster.attr("href"))
+                setUrlWithoutDomain(link.attr("href"))
                 this.title = title
-                thumbnail_url = item.selectFirst("img")?.attr("data-src")
+                thumbnail_url = item.selectFirst("img")?.absUrl("src")
             }
         }
 
@@ -129,20 +127,22 @@ open class YFlixTheme(
 
     // =========================== Anime Details ============================
 
-    protected open fun Document.isMovie(): Boolean = selectFirst(".metadata > span:contains(Movie)") != null
+    protected open fun Document.isMovie(): Boolean = location().contains("/movie/")
 
     override fun animeDetailsParse(response: Response): SAnime = SAnime.create().apply {
         val document = response.asJsoup()
 
-        title = document.selectFirst("h1.title")?.text().orEmpty()
-        thumbnail_url = document.selectFirst("div.poster img")?.attr("src")
+        title = document.selectFirst("h1.detail-title")?.text().orEmpty()
+        thumbnail_url = document.selectFirst("div.detail-poster img")?.absUrl("src")
         val isMovie = document.isMovie()
         status = if (isMovie) SAnime.COMPLETED else SAnime.ONGOING
 
-        genre = document.select("ul.mics li:has(a[href*=/genre/]) a").eachText().joinToString()
-        author = document.select("ul.mics li:has(a[href*=/production/]) a").eachText().joinToString()
+        genre = document.select("div.detail-meta-row:has(span.detail-meta-label:contains(Genres)) a")
+            .eachText().joinToString()
 
-        // fancy score
+        author = document.select("div.detail-meta-row:has(span.detail-meta-label:contains(Director)) a")
+            .eachText().joinToString()
+
         val scorePosition = preferences.scorePosition
         val fancyScore = when (scorePosition) {
             SCORE_POS_TOP, SCORE_POS_BOTTOM -> document.getFancyScore()
@@ -155,26 +155,25 @@ open class YFlixTheme(
                 append("\n\n")
             }
 
-            document.selectFirst(".description")?.text()?.also { append("$it\n\n") }
+            document.selectFirst("p.detail-desc")?.text()?.also { append("$it\n\n") }
 
             val type = if (isMovie) "Movie" else "TV Show"
             append("**Type:** $type\n")
 
-            fun getInfo(label: String): String? = document.selectFirst("ul.mics li:contains($label:)")
-                ?.text()?.substringAfter(":")?.trim()
+            fun getInfo(label: String): String? = document.selectFirst("div.detail-meta-row:has(span.detail-meta-label:contains($label))")
+                ?.selectFirst("span.detail-meta-value")?.text()?.trim()
 
             getInfo("Country")?.let { append("**Country:** $it\n") }
             getInfo("Released")?.let { append("**Released:** $it\n") }
             getInfo("Casts")?.let { append("**Casts:** $it\n") }
 
-            document.selectFirst(".metadata .IMDb")?.text()?.let {
-                val rating = it.substringAfter("IMDb").trim()
+            document.selectFirst("span.badge-imdb")?.text()?.let {
+                val rating = it.removePrefix("IMDb").removePrefix("IMDB").trim()
                 if (rating.isNotEmpty()) append("**IMDb:** $rating")
             }
 
             document.getBackdropUrl()?.let { coverUrl ->
                 if (coverUrl.isNotBlank()) {
-                    // Append the cover URL in Markdown format for display in the app
                     append("\n\n![Cover]($coverUrl)")
                 }
             }
@@ -186,12 +185,14 @@ open class YFlixTheme(
         }
     }
 
-    protected open val backgroundUrlRegex by lazy { """background-image:\s*url\(["']?([^"')]+)["']?\)""".toRegex() }
-    protected open fun Document.getBackdropUrl(): String? = selectFirst("div.detail-bg")
-        ?.attr("style")
-        ?.let { backgroundUrlRegex.find(it)?.groupValues?.getOrNull(1) }
+    protected open fun Document.getBackdropUrl(): String? = selectFirst("div.detail-backdrop-img img")?.absUrl("src")
 
-    protected open fun Document.getScore(): String? = selectFirst("div.rating")?.attr("data-score")
+    protected open fun Document.getScore(): String? = selectFirst("span.badge-imdb")
+        ?.text()
+        ?.removePrefix("IMDb")
+        ?.removePrefix("IMDB")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
 
     protected open fun Document.getFancyScore(): String {
         val score = getScore()
@@ -224,87 +225,118 @@ open class YFlixTheme(
 
     // ============================== Episodes ==============================
 
-    protected open fun Document.contentIdSelect(): String? = selectFirst("div.rating[data-id]")?.attr("data-id")
-
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val animeUrl = baseUrl + anime.url
         val document = client.newCall(GET(animeUrl, docHeaders)).awaitSuccess().use { it.asJsoup() }
-        val contentId = document.contentIdSelect()
-            ?: return emptyList()
 
-        val encryptedId = encrypt(contentId)
-        val ajaxUrl = "$baseUrl/ajax/episodes/list?id=$contentId&_=$encryptedId"
+        val isMovie = document.isMovie()
 
-        val resultDoc = client.newCall(GET(ajaxUrl, ajaxHeaders(animeUrl)))
-            .awaitSuccess().use {
-                it.parseAs<ResultResponse>(json = json).toDocument()
-            }
-
-        return resultDoc.select("ul.episodes[data-season]").flatMap { seasonElement ->
-            val seasonNum = seasonElement.attr("data-season")
-
-            seasonElement.select("li a").map { element ->
-                if (element.selectFirst("span.num") != null) {
-                    tvEpisodeFromElement(element, anime.url, seasonNum)
-                } else {
-                    movieEpisodeFromElement(element, anime.url)
+        return if (isMovie) {
+            listOf(
+                SEpisode.create().apply {
+                    url = anime.url
+                    episode_number = 1F
+                    name = "Movie"
+                },
+            )
+        } else {
+            document.select("div.episode-item[data-season][data-episode]")
+                .map { element ->
+                    val season = element.attr("data-season")
+                    val episode = element.attr("data-episode")
+                    SEpisode.create().apply {
+                        url = "${anime.url}#s$season-e$episode"
+                        episode_number = episode.toFloatOrNull() ?: 0F
+                        name = "S$season E$episode"
+                    }
                 }
-            }
-        }.reversed()
-            .ifEmpty {
-                throw Exception("No episodes/movie found.")
-            }
+                .reversed()
+                .ifEmpty { throw Exception("No episodes found.") }
+        }
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException("Not used.")
 
-    protected open fun tvEpisodeFromElement(element: Element, animeUrl: String, seasonNum: String): SEpisode = SEpisode.create().apply {
-        val epNum = element.attr("num")
-        url = "$animeUrl#${element.attr("eid")}"
-        episode_number = epNum.toFloatOrNull() ?: 0F
-        name = "S$seasonNum E$epNum: ${element.selectFirst("span:not(.num)")?.text()?.trim()}"
-        date_upload = parseDate(element.attr("title"))
-    }
-
-    protected open fun movieEpisodeFromElement(element: Element, animeUrl: String): SEpisode = SEpisode.create().apply {
-        url = "$animeUrl#${element.attr("eid")}"
-        episode_number = 1F
-        name = element.selectFirst("span")?.text()?.trim() ?: "Movie"
-    }
-
     // ============================ Video Links =============================
 
-    protected open val serversSelector = "li.server"
-
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val (animeUrl, episodeId) = episode.url.split('#', limit = 2)
+        val urlParts = episode.url.split('#', limit = 2)
+        val animeUrl = urlParts[0]
+        val fragment = urlParts.getOrNull(1)
         val referer = baseUrl + animeUrl
 
-        val encryptedId = encrypt(episodeId)
-        val serversUrl = "$baseUrl/ajax/links/list?eid=$episodeId&_=$encryptedId"
+        val document = client.newCall(GET(referer, docHeaders)).awaitSuccess().use { it.asJsoup() }
+        val playerWrap = document.selectFirst("div.player-wrap")
+            ?: throw Exception("Player not found")
 
-        val serversDoc = client.newCall(GET(serversUrl, ajaxHeaders(referer)))
-            .awaitSuccess().use {
-                it.parseAs<ResultResponse>(json = json).toDocument()
+        val sourceUrls: List<Pair<String, String>> = if (fragment != null) {
+            // Serie: pedir sources via AJAX
+            val seriesSlug = playerWrap.attr("data-series-slug").takeIf { it.isNotBlank() }
+                ?: return emptyList()
+            val seasonEp = fragment.removePrefix("s").split("-e", limit = 2)
+            val season = seasonEp.getOrNull(0) ?: return emptyList()
+            val ep = seasonEp.getOrNull(1) ?: return emptyList()
+
+            val ajaxUrl = "$baseUrl/ajax/episode/sources?series=$seriesSlug&season=$season&episode=$ep"
+            Log.d("YFlix", "AJAX series: $ajaxUrl")
+
+            runCatching {
+                client.newCall(GET(ajaxUrl, ajaxHeaders(referer)))
+                    .awaitSuccess().use {
+                        it.parseAs<EpisodeSourcesResponse>(json = json).sources
+                            .map { src -> src.name to src.url }
+                    }
+            }.getOrElse {
+                Log.e("YFlix", "Error AJAX series: ${it.message}")
+                emptyList()
             }
+        } else {
+            // Película: leer JSON de data-sources
+            val rawSources = playerWrap.attr("data-sources")
+            Log.d("YFlix", "data-sources crudo: $rawSources")
+            parseSourcesJson(rawSources)
+        }
 
-        return serversDoc.select(serversSelector).parallelCatchingFlatMap { serverElement ->
-            val serverName = serverElement.selectFirst("span")?.text()
-                ?: return@parallelCatchingFlatMap emptyList()
+        Log.d("YFlix", "Servidores: ${sourceUrls.joinToString { it.first }}")
 
+        // Intentar Alpha primero, luego el resto
+        val prioritized = sourceUrls.sortedByDescending { (name, _) ->
+            when (name) {
+                "Alpha" -> 2
+                "Beta" -> 1
+                else -> 0
+            }
+        }
+
+        return prioritized.parallelCatchingFlatMap { (serverName, iframeUrl) ->
             if (serverName !in preferences.hosterPref) return@parallelCatchingFlatMap emptyList()
 
-            val serverId = serverElement.attr("data-lid")
-            val encryptedServerId = encrypt(serverId)
-            val viewUrl = "$baseUrl/ajax/links/view?id=$serverId&_=$encryptedServerId"
+            val absoluteUrl = when {
+                iframeUrl.startsWith("//") -> "https:$iframeUrl"
+                iframeUrl.startsWith("/") -> "$baseUrl$iframeUrl"
+                else -> iframeUrl
+            }
 
-            val encryptedIframeResult = client.newCall(GET(viewUrl, ajaxHeaders(referer)))
-                .awaitSuccess().use {
-                    it.parseAs<ResultResponse>(json = json).result
-                }
+            Log.d("YFlix", "Extrayendo $serverName: $absoluteUrl")
+            rapidShareExtractor.videosFromUrl(absoluteUrl, serverName, preferences.subLangPref)
+        }
+    }
 
-            val iframeUrl = decrypt(encryptedIframeResult)
-            rapidShareExtractor.videosFromUrl(iframeUrl, serverName, preferences.subLangPref)
+    private fun parseSourcesJson(jsonString: String): List<Pair<String, String>> {
+        if (jsonString.isBlank() || jsonString == "[]") return emptyList()
+        return runCatching {
+            json.decodeFromString<List<MovieSource>>(jsonString)
+                .map { it.name to it.url }
+        }.getOrElse {
+            // Intentar desescapando entidades HTML (&quot; → ")
+            runCatching {
+                val unescaped = org.jsoup.parser.Parser.unescapeEntities(jsonString, false)
+                json.decodeFromString<List<MovieSource>>(unescaped)
+                    .map { it.name to it.url }
+            }.getOrElse {
+                Log.e("YFlix", "Error parseando sources JSON: ${it.message}")
+                emptyList()
+            }
         }
     }
 
@@ -316,20 +348,6 @@ open class YFlixTheme(
         .add("X-Requested-With", "XMLHttpRequest")
         .build()
 
-    protected open suspend fun encrypt(text: String): String = client.newCall(
-        GET("https://enc-dec.app/api/enc-movies-flix?text=$text", encdecHeaders),
-    )
-        .awaitSuccess().use {
-            it.parseAs<ResultResponse>(json = json).result
-        }
-
-    protected open suspend fun decrypt(text: String): String = client.newCall(
-        GET("https://enc-dec.app/api/dec-movies-flix?text=$text", encdecHeaders),
-    )
-        .awaitSuccess().use {
-            it.parseAs<DecryptedIframeResponse>(json = json).result.url
-        }
-
     protected open fun parseDate(dateStr: String): Long = runCatching { DATE_FORMATTER.parse(dateStr)?.time }.getOrNull() ?: 0L
 
     override fun List<Video>.sort(): List<Video> {
@@ -338,15 +356,11 @@ open class YFlixTheme(
         val qualities = QUALITIES.reversed()
 
         return sortedWith(
-            // Prioritize videos that have the exact preferred quality and server
             compareByDescending<Video> {
                 it.quality.contains(quality, true) && it.quality.startsWith(server, true)
             }
-                // Then, prioritize videos with the preferred quality from any server
                 .thenByDescending { it.quality.contains(quality, true) }
-                // Then, prioritize videos from the preferred server with any quality
                 .thenByDescending { it.quality.startsWith(server, true) }
-                // Finally, sort by the quality list as a fallback
                 .thenByDescending { video -> qualities.indexOfFirst { video.quality.contains(it) } },
         )
     }
@@ -360,16 +374,13 @@ open class YFlixTheme(
     protected open val SharedPreferences.scorePosition by preferences.delegate(PREF_SCORE_POSITION_KEY, PREF_SCORE_POSITION_DEFAULT)
 
     protected open fun SharedPreferences.clearOldPrefs(): SharedPreferences {
-        val domain = getString(PREF_DOMAIN_KEY, defaultDomain)
-            ?: return this
+        val domain = getString(PREF_DOMAIN_KEY, defaultDomain) ?: return this
         val domainHost = domain.toHttpUrlOrNull()?.host ?: domain
         if (domainHost !in domainList) {
-            edit()
-                .putString(PREF_DOMAIN_KEY, defaultDomain)
-                .apply()
+            edit().putString(PREF_DOMAIN_KEY, defaultDomain).apply()
         }
         val hostToggle = getStringSet(PREF_HOSTER_KEY, SERVERS.toSet()) ?: return this
-        if (hostToggle.any { it !in SERVERS }) {
+        if (hostToggle.any { it !in SERVERS } || !hostToggle.contains("Alpha")) {
             edit()
                 .putStringSet(PREF_HOSTER_KEY, SERVERS.toSet())
                 .putString(PREF_SERVER_KEY, PREF_SERVER_DEFAULT)
@@ -446,27 +457,19 @@ open class YFlixTheme(
 
         const val PREF_SUB_LANG_KEY = "pref_sub_lang_key"
         protected val SUB_LANGS = listOf(
-            "English",
-            "Arabic",
-            "Chinese",
-            "French",
-            "German",
-            "Indonesian",
-            "Italian",
-            "Japanese",
-            "Korean",
-            "Persian",
-            "Portuguese",
-            "Russian",
-            "Spanish",
-            "Turkish",
-            "Urdu",
-            "Vietnamese",
+            "English", "Arabic", "Chinese", "French", "German",
+            "Indonesian", "Italian", "Japanese", "Korean", "Persian",
+            "Portuguese", "Russian", "Spanish", "Turkish", "Urdu", "Vietnamese",
         )
         internal val PREF_SUB_LANG_DEFAULT = SUB_LANGS.first()
 
         const val PREF_SERVER_KEY = "pref_server_key"
-        protected val SERVERS = listOf("Server 1", "Server 2")
+        protected val SERVERS = listOf(
+            "Alpha", "Beta", "Gamma", "Delta", "Sigma",
+            "Omega", "Zeta", "Theta", "Iota", "Kappa",
+            "Server 1", "Server 2", "Server 3", "Server 4", "Server 5",
+            "Server 6", "Server 7", "Server 8", "Server 9", "Server 10",
+        )
         protected val PREF_SERVER_DEFAULT = SERVERS.first()
 
         const val PREF_HOSTER_KEY = "pref_hoster_key"

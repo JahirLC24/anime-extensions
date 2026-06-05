@@ -6,6 +6,6 @@ class YFlix :
     YFlixTheme(
         "YFlix",
         listOf(
-            "yflix.to",
+            "yflix.ws",
         ),
     )

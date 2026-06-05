@@ -2,7 +2,7 @@ ext {
     extName = 'YFlix'
     extClass = '.YFlix'
     themePkg = 'yflixtheme'
-    baseUrl = 'https://yflix.to'
+    baseUrl = 'https://yflix.ws'
     overrideVersionCode = 4
     isNsfw = true
 }
